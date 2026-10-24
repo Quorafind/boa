@@ -13,8 +13,7 @@ use crate::{
     function::{
         ArrowFunction, AsyncArrowFunction, AsyncFunctionDeclaration, AsyncFunctionExpression,
         AsyncGeneratorDeclaration, AsyncGeneratorExpression, ClassDeclaration, ClassElement,
-        ClassElementName,
-        ClassExpression, FormalParameterList, FunctionBody, FunctionDeclaration,
+        ClassElementName, ClassExpression, FormalParameterList, FunctionBody, FunctionDeclaration,
         FunctionExpression, GeneratorDeclaration, GeneratorExpression,
     },
     operations::{
