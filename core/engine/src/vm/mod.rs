@@ -83,6 +83,10 @@ pub struct Vm {
     pub(crate) pending_exception: Option<JsError>,
     pub(crate) runtime_limits: RuntimeLimits,
 
+    /// Set by another thread to stop what is running; see
+    /// [`Context::interrupt_handle`](crate::Context::interrupt_handle).
+    pub(crate) interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+
     /// This is used to assign a native (rust) function as the active function,
     /// because we don't push a frame for them.
     pub(crate) native_active_function: Option<JsObject>,
@@ -418,6 +422,7 @@ impl Vm {
             return_value: JsValue::undefined(),
             pending_exception: None,
             runtime_limits: RuntimeLimits::default(),
+            interrupt: None,
             native_active_function: None,
             host_call_depth: 0,
             shadow_stack: ShadowStack::default(),
@@ -1013,8 +1018,22 @@ impl Context {
         CompletionRecord::Throw(JsError::from_native(JsNativeError::error()))
     }
 
+    /// Throws, uncatchably, when the host has asked for what is running to stop — and clears the
+    /// request, so what runs next runs.
+    #[inline]
+    pub(crate) fn check_interrupt(&self) -> JsResult<()> {
+        if let Some(flag) = &self.vm.interrupt
+            && flag.load(std::sync::atomic::Ordering::Relaxed)
+            && flag.swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(RuntimeLimitError::Interrupted.into());
+        }
+        Ok(())
+    }
+
     /// Checks if we haven't exceeded the defined runtime limits.
     pub(crate) fn check_runtime_limits(&self) -> JsResult<()> {
+        self.check_interrupt()?;
         // Must throw if the number of recursive calls exceeds the defined limit.
         //
         // `host_call_depth` accounts for nested host calls that re-enter the VM by invoking

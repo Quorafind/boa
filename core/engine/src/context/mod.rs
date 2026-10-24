@@ -576,6 +576,17 @@ impl Context {
         Rc::downcast(self.module_loader.clone()).ok()
     }
 
+    /// A handle any thread can use to stop what this context is running: the next loop
+    /// iteration or call throws a [`RuntimeLimitError::Interrupted`](crate::RuntimeLimitError),
+    /// which JavaScript cannot catch. Every handle asked for stops the same context.
+    pub fn interrupt_handle(&mut self) -> InterruptHandle {
+        let flag = self
+            .vm
+            .interrupt
+            .get_or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        InterruptHandle(std::sync::Arc::clone(flag))
+    }
+
     /// Get the [`RuntimeLimits`].
     #[inline]
     #[must_use]
@@ -1320,5 +1331,22 @@ where
         if let Some(cleanup) = self.cleanup.take() {
             cleanup(self.context);
         }
+    }
+}
+
+/// Stops what a [`Context`] is running, from any thread; see [`Context::interrupt_handle`].
+#[derive(Debug, Clone)]
+pub struct InterruptHandle(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl InterruptHandle {
+    /// Asks the context to stop: what it is running throws at its next loop iteration or call.
+    /// Asked while nothing runs, it stops the next thing that does.
+    pub fn interrupt(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Withdraws a request not yet acted on.
+    pub fn clear(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }

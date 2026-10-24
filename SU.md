@@ -29,6 +29,12 @@ always agree with one another.
   makes one). On Dataview's heap in Su, a collection's pause fell from ~30–45 ms to ~21–35 ms;
   the sweep part of it from 10–25 ms to ~1 ms.
 
+- `boa_engine`: `Context::interrupt_handle()` hands out an `InterruptHandle` any thread can use
+  to stop what the context is running — V8's `TerminateExecution`. The next loop iteration or call
+  throws `RuntimeLimitError::Interrupted`, an engine error JavaScript cannot catch, and the
+  request is used up, so what runs next runs. For an embedder whose watchdog finds a script that
+  will not return.
+
 ## Keeping it
 
 Rebase onto the next release tag when Su moves to it, and drop what upstream has fixed.
