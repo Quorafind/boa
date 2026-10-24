@@ -16,6 +16,10 @@ always agree with one another.
   owns `this` (`Scope::mark_arrow`, set in `visit_function_like`). Before, the method's `this` was
   not kept and the inner arrow read `undefined` (Admonition's and Day Planner's settings).
 
+- `boa_engine`, `builtins/regexp`: a compiled pattern is kept per thread by its source and flags
+  (`COMPILED`, up to 1024 of them), so a regular expression literal evaluated again — once per
+  line of a note, in Dataview's parser — no longer compiles its pattern every time.
+
 ## Keeping it
 
 Rebase onto the next release tag when Su moves to it, and drop what upstream has fixed.

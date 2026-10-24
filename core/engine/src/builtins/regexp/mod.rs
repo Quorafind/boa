@@ -26,7 +26,22 @@ use boa_gc::{Finalize, Trace};
 use boa_macros::{js_str, utf16};
 use boa_parser::lexer::regex::RegExpFlags;
 use regress::{Flags, Range, Regex};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::str::FromStr;
+
+/// How many compiled patterns a thread keeps; past it the cache starts over.
+const COMPILED_LIMIT: usize = 1024;
+
+thread_local! {
+    /// Patterns already compiled on this thread, by their source and flags.
+    ///
+    /// A regular expression literal makes a new `RegExp` every time it is evaluated, and making
+    /// one compiled its pattern again — so a literal inside a function called per line of a
+    /// document compiled the same pattern once a line. A compiled pattern is immutable; the
+    /// object's `lastIndex` and the rest of its state are not in it.
+    static COMPILED: RefCell<HashMap<(JsString, u8), Regex>> = RefCell::new(HashMap::new());
+}
 
 use super::{BuiltInBuilder, BuiltInConstructor, IntrinsicObject};
 
@@ -348,6 +363,17 @@ impl RegExp {
             Ok(result) => result,
         };
 
+        // A pattern this thread compiled before, with the same flags, is the same matcher.
+        let key = (p.clone(), flags.bits());
+        if let Some(matcher) = COMPILED.with(|compiled| compiled.borrow().get(&key).cloned()) {
+            return Ok(RegExp {
+                matcher,
+                flags,
+                original_source: p,
+                original_flags: f,
+            });
+        }
+
         // 13. Let parseResult be ParsePattern(patternText, u, v).
         // 14. If parseResult is a non-empty List of SyntaxError objects, throw a SyntaxError exception.
 
@@ -393,6 +419,13 @@ impl RegExp {
         //     [[CapturingGroupsCount]]: capturingGroupsCount }.
         // 20. Set obj.[[RegExpRecord]] to rer.
         // 21. Set obj.[[RegExpMatcher]] to CompilePattern of parseResult with argument rer.
+        COMPILED.with(|compiled| {
+            let mut compiled = compiled.borrow_mut();
+            if compiled.len() >= COMPILED_LIMIT {
+                compiled.clear();
+            }
+            compiled.insert(key, matcher.clone());
+        });
         Ok(RegExp {
             matcher,
             flags,
