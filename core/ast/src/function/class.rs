@@ -687,7 +687,7 @@ impl VisitWith for ClassElement {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClassMethodDefinition {
-    name: ClassElementName,
+    pub(crate) name: ClassElementName,
     pub(crate) parameters: FormalParameterList,
     pub(crate) body: FunctionBody,
     pub(crate) contains_direct_eval: bool,

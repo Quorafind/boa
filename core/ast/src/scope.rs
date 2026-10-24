@@ -103,6 +103,8 @@ pub(crate) struct Inner {
     index: Cell<u32>,
     bindings: RefCell<Vec<Binding>>,
     function: bool,
+    // An arrow function's: it has no `this` of its own (patched in Su, see VENDORED.md).
+    arrow: Cell<bool>,
     // Has the `this` been accessed/escaped outside the function environment boundary.
     this_escaped: Cell<bool>,
 
@@ -120,6 +122,7 @@ impl Scope {
                 index: Cell::default(),
                 bindings: RefCell::default(),
                 function: true,
+                arrow: Cell::new(false),
                 this_escaped: Cell::new(false),
                 context: Rc::default(),
             }),
@@ -135,6 +138,7 @@ impl Scope {
                 index: Cell::new(parent.inner.index.get() + 1),
                 bindings: RefCell::default(),
                 function,
+                arrow: Cell::new(false),
                 this_escaped: Cell::new(false),
                 context: parent.inner.context.clone(),
                 outer: Some(parent),
@@ -355,13 +359,22 @@ impl Scope {
         }
     }
 
+    /// Marks this function scope as an arrow function's: one whose `this` is its
+    /// enclosing function's.
+    pub(crate) fn mark_arrow(&self) {
+        self.inner.arrow.set(true);
+    }
+
     /// Escape enclosing function environment's `this`.
+    ///
+    /// The function whose `this` it is: past every arrow function on the way, which has none
+    /// of its own — so `this` in an arrow within an arrow keeps the method's.
     pub fn escape_this_in_enclosing_function_scope(&self) {
         let mut current = self;
         let mut crossed_function_border = false;
 
         loop {
-            if crossed_function_border && current.is_function() {
+            if crossed_function_border && current.is_function() && !current.inner.arrow.get() {
                 current.inner.this_escaped.set(true);
                 return;
             }

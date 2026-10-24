@@ -13,6 +13,7 @@ use crate::{
     function::{
         ArrowFunction, AsyncArrowFunction, AsyncFunctionDeclaration, AsyncFunctionExpression,
         AsyncGeneratorDeclaration, AsyncGeneratorExpression, ClassDeclaration, ClassElement,
+        ClassElementName,
         ClassExpression, FormalParameterList, FunctionBody, FunctionDeclaration,
         FunctionExpression, GeneratorDeclaration, GeneratorExpression,
     },
@@ -438,12 +439,20 @@ impl<'ast> VisitorMut<'ast> for BindingEscapeAnalyzer<'_> {
         node: &'ast mut ClassElement,
     ) -> ControlFlow<Self::BreakTy> {
         match node {
-            ClassElement::MethodDefinition(node) => self.visit_function_like(
-                &mut node.parameters,
-                &mut node.body,
-                &mut node.scopes,
-                node.contains_direct_eval,
-            ),
+            ClassElement::MethodDefinition(node) => {
+                // Su: a computed name (`[key]() {}`) is an expression of the scope the class
+                // is in, and must be visited as a field's is — left out, a binding it names
+                // from an outer function is read from the wrong environment.
+                if let ClassElementName::PropertyName(name) = &mut node.name {
+                    self.visit_property_name_mut(name)?;
+                }
+                self.visit_function_like(
+                    &mut node.parameters,
+                    &mut node.body,
+                    &mut node.scopes,
+                    node.contains_direct_eval,
+                )
+            }
             ClassElement::FieldDefinition(field) | ClassElement::StaticFieldDefinition(field) => {
                 self.visit_property_name_mut(&mut field.name)?;
                 if let Some(e) = &mut field.initializer {
@@ -835,6 +844,10 @@ impl<'ast> VisitorMut<'ast> for BindingCollectorVisitor<'_> {
     ) -> ControlFlow<Self::BreakTy> {
         match node {
             ClassElement::MethodDefinition(node) => {
+                // Su: the computed name too; see above.
+                if let ClassElementName::PropertyName(name) = &mut node.name {
+                    self.visit_property_name_mut(name)?;
+                }
                 let strict = node.body.strict();
                 self.visit_function_like(
                     &mut node.body,
@@ -1192,6 +1205,9 @@ impl BindingCollectorVisitor<'_> {
         } else {
             Scope::new(self.scope.clone(), true)
         };
+        if arrow {
+            function_scope.mark_arrow();
+        }
 
         let function_scopes = function_declaration_instantiation(
             body,
@@ -1480,6 +1496,10 @@ impl<'ast> VisitorMut<'ast> for ScopeIndexVisitor {
     ) -> ControlFlow<Self::BreakTy> {
         match node {
             ClassElement::MethodDefinition(node) => {
+                // Su: the computed name too; see above.
+                if let ClassElementName::PropertyName(name) = &mut node.name {
+                    self.visit_property_name_mut(name)?;
+                }
                 let contains_direct_eval = node.contains_direct_eval();
                 self.visit_function_like(
                     &mut node.body,
