@@ -48,7 +48,11 @@ thread_local!(static BOA_GC: RefCell<BoaGc> = RefCell::new( BoaGc {
     strongs: Vec::default(),
     weaks: Vec::default(),
     weak_maps: Vec::default(),
+    unfreed: Vec::default(),
 }));
+
+/// How many dead nodes an allocation frees, at most, of those a collection left unfreed.
+const FREE_PER_ALLOCATION: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 struct GcConfig {
@@ -84,6 +88,11 @@ struct BoaGc {
     strongs: Vec<GcErasedPointer>,
     weaks: Vec<EphemeronPointer>,
     weak_maps: Vec<ErasedWeakMapBoxPointer>,
+    /// Nodes a collection found dead and finalized but has not freed yet: freed a few at a time
+    /// by later allocations, and all of them before the next collection. Nothing can reach them
+    /// (they were unreachable, their finalizers have run, and every weak reference to them was
+    /// cleared), so when their memory is returned changes nothing but when the cost is paid.
+    unfreed: Vec<GcErasedPointer>,
 }
 
 impl Drop for BoaGc {
@@ -134,6 +143,8 @@ impl Allocator {
             let mut gc = st.borrow_mut();
 
             Self::manage_state(&mut gc);
+            // SAFETY: `unfreed` only holds nodes a collection found unreachable and finalized.
+            unsafe { Collector::free_unfreed(&mut gc, FREE_PER_ALLOCATION) };
             // Safety: value cannot be a null pointer, since `Box` cannot return null pointers.
             let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(value))) };
             let erased: NonNull<GcBox<NonTraceable>> = ptr.cast();
@@ -153,6 +164,8 @@ impl Allocator {
             let mut gc = st.borrow_mut();
 
             Self::manage_state(&mut gc);
+            // SAFETY: `unfreed` only holds nodes a collection found unreachable and finalized.
+            unsafe { Collector::free_unfreed(&mut gc, FREE_PER_ALLOCATION) };
             // Safety: value cannot be a null pointer, since `Box` cannot return null pointers.
             let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(value))) };
             let erased: NonNull<dyn ErasedEphemeronBox> = ptr;
@@ -224,6 +237,10 @@ impl Collector {
     /// Run a collection on the full heap.
     fn collect(gc: &mut BoaGc) {
         gc.runtime.collections += 1;
+        // What the last collection left unfreed goes first: the heap walked below is only the
+        // nodes still in it.
+        // SAFETY: `unfreed` only holds nodes a collection found unreachable and finalized.
+        unsafe { Self::free_unfreed(gc, usize::MAX) };
 
         Self::trace_non_roots(gc);
 
@@ -237,11 +254,23 @@ impl Collector {
         if !unreachables.strong.is_empty() || !unreachables.weak.is_empty() {
             // Finalize all the unreachable nodes.
             // SAFETY: All passed pointers are valid, since we won't deallocate until `Self::sweep`.
-            unsafe { Self::finalize(unreachables) };
+            unsafe { Self::finalize(&unreachables) };
 
-            // Reuse the tracer's already allocated capacity.
-            let _final_unreachables =
-                Self::mark_heap(&mut tracer, &gc.strongs, &gc.weaks, &gc.weak_maps);
+            // A finalizer can resurrect a node only by keeping a new reference to it, which makes
+            // it a root; marking again from the roots is for that, and is skipped when no dead
+            // node became one. Marked nodes are not traced again, so a second marking with no new
+            // root marks nothing and only walks the heap. With ephemerons among the dead, whose
+            // finalizers are harder to see through, it always runs.
+            let resurrected = !unreachables.weak.is_empty()
+                || unreachables.strong.iter().any(|node| {
+                    // SAFETY: nothing has been freed yet.
+                    unsafe { node.as_ref() }.is_rooted()
+                });
+            if resurrected {
+                // Reuse the tracer's already allocated capacity.
+                let _final_unreachables =
+                    Self::mark_heap(&mut tracer, &gc.strongs, &gc.weaks, &gc.weak_maps);
+            }
         }
 
         // SAFETY: The head of our linked list is always valid per the invariants of our GC.
@@ -249,6 +278,7 @@ impl Collector {
             Self::sweep(
                 &mut gc.strongs,
                 &mut gc.weaks,
+                &mut gc.unfreed,
                 &mut gc.runtime.bytes_allocated,
             );
         }
@@ -419,8 +449,8 @@ impl Collector {
     /// # Safety
     ///
     /// Passing a `strong` or a `weak` vec with invalid pointers will result in Undefined Behaviour.
-    unsafe fn finalize(unreachables: Unreachables) {
-        for node in unreachables.strong {
+    unsafe fn finalize(unreachables: &Unreachables) {
+        for &node in &unreachables.strong {
             // SAFETY: The caller must ensure all pointers inside `unreachables.strong` are valid.
             let node_ref = unsafe { node.as_ref() };
             let run_finalizer_fn = node_ref.run_finalizer_fn();
@@ -430,7 +460,7 @@ impl Collector {
                 run_finalizer_fn(node);
             }
         }
-        for node in unreachables.weak {
+        for &node in &unreachables.weak {
             // SAFETY: The caller must ensure all pointers inside `unreachables.weak` are valid.
             let node = unsafe { node.as_ref() };
             node.finalize_and_clear();
@@ -446,6 +476,7 @@ impl Collector {
     unsafe fn sweep(
         strong: &mut Vec<GcErasedPointer>,
         weak: &mut Vec<EphemeronPointer>,
+        unfreed: &mut Vec<GcErasedPointer>,
         total_allocated: &mut usize,
     ) {
         let _guard = DropGuard::new();
@@ -459,16 +490,9 @@ impl Collector {
 
                 true
             } else {
-                // SAFETY: The algorithm ensures only unmarked/unreachable pointers are dropped.
-                // The caller must ensure all pointers were allocated by `Box::into_raw(Box::new(..))`.
-                let drop_fn = node_ref.drop_fn();
-                let size = node_ref.size();
-                *total_allocated -= size;
-
-                // SAFETY: The function pointer is appropriate for this node type because we extract it from it's VTable.
-                unsafe {
-                    drop_fn(*node);
-                }
+                // Out of the heap now, freed later; see `BoaGc::unfreed`.
+                *total_allocated -= node_ref.size();
+                unfreed.push(*node);
 
                 false
             }
@@ -495,8 +519,35 @@ impl Collector {
         });
     }
 
+    /// Frees up to `count` of the nodes collections left unfreed.
+    ///
+    /// # Safety
+    ///
+    /// Every node in `gc.unfreed` must have been found unreachable and finalized by a
+    /// collection, and not freed since.
+    unsafe fn free_unfreed(gc: &mut BoaGc, count: usize) {
+        if gc.unfreed.is_empty() {
+            return;
+        }
+        let _guard = DropGuard::new();
+        let keep = gc.unfreed.len().saturating_sub(count);
+        for node in gc.unfreed.drain(keep..) {
+            // SAFETY: The function pointer is appropriate for this node type because we extract
+            // it from its VTable; the node is unreachable, finalized and not yet freed.
+            unsafe {
+                let drop_fn = node.as_ref().drop_fn();
+                drop_fn(node);
+            }
+        }
+        if gc.unfreed.is_empty() {
+            gc.unfreed = Vec::new();
+        }
+    }
+
     // Clean up the heap when BoaGc is dropped
     fn dump(gc: &mut BoaGc) {
+        // SAFETY: `unfreed` only holds nodes a collection found unreachable and finalized.
+        unsafe { Self::free_unfreed(gc, usize::MAX) };
         // Weak maps have to be dropped first, since the process dereferences GcBoxes.
         // This can be done without initializing a dropguard since no GcBox's are being dropped.
         for node in mem::take(&mut gc.weak_maps) {
@@ -538,6 +589,9 @@ pub fn force_collect() {
         if gc.runtime.bytes_allocated > 0 {
             Collector::collect(&mut gc);
         }
+        // Forced: what it found dead is freed now, too.
+        // SAFETY: `unfreed` only holds nodes a collection found unreachable and finalized.
+        unsafe { Collector::free_unfreed(&mut gc, usize::MAX) };
     });
 }
 
